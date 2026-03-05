@@ -1,0 +1,120 @@
+apiVersion: scaffolder.backstage.io/v1beta3
+kind: Template
+metadata:
+  name: spring-boot-template
+  title: Java Spring Boot Service
+  description: Creates a Java 21 Spring Boot service with Gradle, CI/CD pipeline, and Docker deployment to GHCR
+  tags:
+    - java
+    - spring-boot
+    - gradle
+    - recommended
+spec:
+  owner: user:guest
+  type: service
+
+  parameters:
+    - title: Provide component information
+      required:
+        - name
+        - description
+        - owner
+        - javaPackage
+      properties:
+        name:
+          title: Name
+          type: string
+          description: Unique name of the component
+          ui:autofocus: true
+          pattern: '^[a-z0-9-]+$'
+          ui:help: 'Use lowercase letters, numbers, and hyphens only'
+        description:
+          title: Description
+          type: string
+          description: Short description of the component
+        owner:
+          title: Owner
+          type: string
+          description: Owner of the component
+          ui:field: OwnerPicker
+          ui:options:
+            catalogFilter:
+              kind: [Group, User]
+        javaPackage:
+          title: Java Package
+          type: string
+          description: 'Java package name, e.g. com.example.myservice'
+          pattern: '^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)*$'
+          ui:help: 'Use lowercase letters and dots only, e.g. com.example.myservice'
+        springBootVersion:
+          title: Spring Boot Version
+          type: string
+          description: Spring Boot version to use
+          default: '3.4.3'
+          enum:
+            - '3.4.3'
+            - '3.3.8'
+          enumNames:
+            - '3.4.3 (Latest)'
+            - '3.3.8 (LTS)'
+
+    - title: Choose a location
+      required:
+        - repoUrl
+      properties:
+        repoUrl:
+          title: Repository Location
+          type: string
+          ui:field: RepoUrlPicker
+          ui:options:
+            allowedHosts:
+              - github.com
+
+  steps:
+    - id: fetch-base
+      name: Fetch Base
+      action: fetch:template
+      input:
+        url: ./content
+        values:
+          name: ${{ parameters.name }}
+          description: ${{ parameters.description }}
+          owner: ${{ parameters.owner }}
+          javaPackage: ${{ parameters.javaPackage }}
+          javaPackageDir: ${{ parameters.javaPackage | replace(".", "/") }}
+          springBootVersion: ${{ parameters.springBootVersion }}
+          repoSlug: ${{ parameters.repoUrl | parseRepoUrl | pick('owner') }}/${{ parameters.repoUrl | parseRepoUrl | pick('repo') }}
+
+    - id: publish
+      name: Publish
+      action: publish:github
+      input:
+        description: ${{ parameters.description }}
+        repoUrl: ${{ parameters.repoUrl }}
+        defaultBranch: main
+
+    - id: register
+      name: Register
+      action: catalog:register
+      input:
+        repoContentsUrl: ${{ steps['publish'].output.repoContentsUrl }}
+        catalogInfoPath: '/catalog-info.yaml'
+
+    - id: notify
+      name: Notify
+      action: notification:send
+      input:
+        recipients: entity
+        entityRefs:
+          - user:default/guest
+        title: 'Spring Boot service created'
+        info: 'Your Spring Boot service ${{ parameters.name }} has been created'
+        severity: normal
+
+  output:
+    links:
+      - title: Repository
+        url: ${{ steps['publish'].output.remoteUrl }}
+      - title: Open in catalog
+        icon: catalog
+        entityRef: ${{ steps['register'].output.entityRef }}
