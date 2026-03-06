@@ -54,4 +54,15 @@ This project includes a GitHub Actions workflow that runs on every push:
 
 - **Build** - Compiles the project with Gradle
 - **Test** - Runs JUnit tests
-- **Deploy** - Builds and pushes a Docker image to GHCR (main branch only)
+- **Deploy** - Builds Docker image, pushes to AWS ECR, and deploys to ECS Fargate (main branch only)
+
+### Required GitHub Secrets
+
+Set these at the GitHub organization level or per-repo:
+
+- `AWS_ACCESS_KEY_ID` - IAM user access key with ECR + ECS permissions
+- `AWS_SECRET_ACCESS_KEY` - Corresponding secret key
+
+### AWS Infrastructure
+
+The deploy step expects shared infrastructure (VPC, ECS cluster, security group) provisioned via the `backstage-shared-infra` CloudFormation stack. See the Backstage portal documentation for setup instructions.

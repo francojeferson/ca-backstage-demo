@@ -3,11 +3,12 @@ kind: Template
 metadata:
   name: spring-boot-template
   title: Java Spring Boot Service
-  description: Creates a Java 21 Spring Boot service with Gradle, CI/CD pipeline, and Docker deployment to GHCR
+  description: Creates a Java 21 Spring Boot service with Gradle, CI/CD pipeline, and deployment to AWS ECS Fargate
   tags:
     - java
     - spring-boot
     - gradle
+    - aws
     - recommended
 spec:
   owner: user:guest
@@ -92,6 +93,7 @@ spec:
         description: ${{ parameters.description }}
         repoUrl: ${{ parameters.repoUrl }}
         defaultBranch: main
+        repoVisibility: public
 
     - id: register
       name: Register

@@ -48,6 +48,12 @@ catalog:
       rules:
         - allow: [Template]
 
+    # Spring Boot template
+    - type: file
+      target: ./examples/spring-boot-template/template.yaml
+      rules:
+        - allow: [Template]
+
     # Local example organizational data
     - type: file
       target: ./examples/org.yaml

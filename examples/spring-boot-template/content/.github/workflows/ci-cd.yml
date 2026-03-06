@@ -9,7 +9,13 @@ on:
 permissions:
   checks: write
   contents: read
-  packages: write
+  id-token: write
+
+env:
+  AWS_REGION: us-east-2
+  ECR_REPOSITORY: ${{ "${{ github.event.repository.name }}" }}
+  ECS_CLUSTER: backstage-apps
+  ECS_SERVICE: ${{ "${{ github.event.repository.name }}" }}
 
 jobs:
   build:
@@ -60,16 +66,95 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: docker/login-action@v3
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          registry: ghcr.io
-          username: ${{ "${{ github.actor }}" }}
-          password: ${{ "${{ secrets.GITHUB_TOKEN }}" }}
+          aws-access-key-id: ${{ "${{ secrets.AWS_ACCESS_KEY_ID }}" }}
+          aws-secret-access-key: ${{ "${{ secrets.AWS_SECRET_ACCESS_KEY }}" }}
+          aws-region: ${{ "${{ env.AWS_REGION }}" }}
 
-      - uses: docker/build-push-action@v5
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Create ECR repository if not exists
+        run: |
+          aws ecr describe-repositories --repository-names ${{ "${{ env.ECR_REPOSITORY }}" }} --region ${{ "${{ env.AWS_REGION }}" }} 2>/dev/null || \
+          aws ecr create-repository --repository-name ${{ "${{ env.ECR_REPOSITORY }}" }} --region ${{ "${{ env.AWS_REGION }}" }} --image-scanning-configuration scanOnPush=true
+
+      - name: Build, tag, and push Docker image to ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ "${{ steps.login-ecr.outputs.registry }}" }}
+          IMAGE_TAG: ${{ "${{ github.sha }}" }}
+        run: |
+          docker build -t $ECR_REGISTRY/${{ "${{ env.ECR_REPOSITORY }}" }}:$IMAGE_TAG .
+          docker tag $ECR_REGISTRY/${{ "${{ env.ECR_REPOSITORY }}" }}:$IMAGE_TAG $ECR_REGISTRY/${{ "${{ env.ECR_REPOSITORY }}" }}:latest
+          docker push $ECR_REGISTRY/${{ "${{ env.ECR_REPOSITORY }}" }}:$IMAGE_TAG
+          docker push $ECR_REGISTRY/${{ "${{ env.ECR_REPOSITORY }}" }}:latest
+          echo "image=$ECR_REGISTRY/${{ "${{ env.ECR_REPOSITORY }}" }}:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Get AWS account ID
+        id: aws-account
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "account_id=$ACCOUNT_ID" >> $GITHUB_OUTPUT
+
+      - name: Update task definition with account ID
+        run: |
+          sed -i "s/ACCOUNT_ID/${{ "${{ steps.aws-account.outputs.account_id }}" }}/g" aws/task-definition.json
+
+      - name: Render Amazon ECS task definition
+        id: render-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
         with:
-          context: .
-          push: true
-          tags: |
-            ghcr.io/${{ "${{ github.repository }}" }}:${{ "${{ github.sha }}" }}
-            ghcr.io/${{ "${{ github.repository }}" }}:latest
+          task-definition: aws/task-definition.json
+          container-name: ${{ "${{ env.ECR_REPOSITORY }}" }}
+          image: ${{ "${{ steps.build-image.outputs.image }}" }}
+
+      - name: Register task definition
+        id: register-task-def
+        run: |
+          TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://${{ "${{ steps.render-task-def.outputs.task-definition }}" }} \
+            --query "taskDefinition.taskDefinitionArn" --output text)
+          echo "task_def_arn=$TASK_DEF_ARN" >> $GITHUB_OUTPUT
+
+      - name: Get shared infrastructure outputs
+        id: infra
+        run: |
+          SUBNETS=$(aws cloudformation describe-stacks --stack-name backstage-shared-infra --query "Stacks[0].Outputs[?ExportName=='backstage-subnet-a-id'].OutputValue" --output text)
+          SUBNETS="$SUBNETS,$(aws cloudformation describe-stacks --stack-name backstage-shared-infra --query "Stacks[0].Outputs[?ExportName=='backstage-subnet-b-id'].OutputValue" --output text)"
+          SG=$(aws cloudformation describe-stacks --stack-name backstage-shared-infra --query "Stacks[0].Outputs[?ExportName=='backstage-ecs-sg-id'].OutputValue" --output text)
+          echo "subnets=$SUBNETS" >> $GITHUB_OUTPUT
+          echo "security_group=$SG" >> $GITHUB_OUTPUT
+
+      - name: Create ECS service if not exists
+        run: |
+          aws ecs describe-services --cluster ${{ "${{ env.ECS_CLUSTER }}" }} --services ${{ "${{ env.ECS_SERVICE }}" }} --region ${{ "${{ env.AWS_REGION }}" }} \
+            --query "services[?status=='ACTIVE'].serviceName" --output text | grep -q "${{ "${{ env.ECS_SERVICE }}" }}" || \
+          aws ecs create-service \
+            --cluster ${{ "${{ env.ECS_CLUSTER }}" }} \
+            --service-name ${{ "${{ env.ECS_SERVICE }}" }} \
+            --task-definition ${{ "${{ steps.register-task-def.outputs.task_def_arn }}" }} \
+            --desired-count 1 \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[${{ "${{ steps.infra.outputs.subnets }}" }}],securityGroups=[${{ "${{ steps.infra.outputs.security_group }}" }}],assignPublicIp=ENABLED}" \
+            --region ${{ "${{ env.AWS_REGION }}" }}
+
+      - name: Deploy to Amazon ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ "${{ steps.render-task-def.outputs.task-definition }}" }}
+          service: ${{ "${{ env.ECS_SERVICE }}" }}
+          cluster: ${{ "${{ env.ECS_CLUSTER }}" }}
+          wait-for-service-stability: true
+
+      - name: Print service public IP
+        if: success()
+        run: |
+          TASK_ARN=$(aws ecs list-tasks --cluster ${{ "${{ env.ECS_CLUSTER }}" }} --service-name ${{ "${{ env.ECS_SERVICE }}" }} --query "taskArns[0]" --output text)
+          ENI_ID=$(aws ecs describe-tasks --cluster ${{ "${{ env.ECS_CLUSTER }}" }} --tasks $TASK_ARN --query "tasks[0].attachments[0].details[?name=='networkInterfaceId'].value" --output text)
+          PUBLIC_IP=$(aws ec2 describe-network-interfaces --network-interface-ids $ENI_ID --query "NetworkInterfaces[0].Association.PublicIp" --output text)
+          echo "Service is running at http://$PUBLIC_IP:8080"
+          echo "Health check: http://$PUBLIC_IP:8080/actuator/health"
